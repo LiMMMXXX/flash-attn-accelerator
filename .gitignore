@@ -1,0 +1,15 @@
+﻿# Hardware
+*.vcd *.fsdb *.vpd *.wl
+synth/ build/ *.dcp *.bit *.runs *.jou *.log
+
+# Software
+*.o *.obj *.exe *.dll *.so *.a *.lib
+__pycache__/ *.pyc .venv/ venv/
+build/ cmake-build-*/ out/
+
+# IDE
+.idea/ .vscode/ *.swp *.swo
+.vs/ *.suo *.user *.log
+
+# OS
+.DS_Store Thumbs.db desktop.ini
