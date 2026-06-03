@@ -17,6 +17,63 @@ flash-attn-accelerator/
   scripts/     <- 构建脚本
   tests/       <- 测试用例
 
+
+---
+
+## 分支详解
+
+### 什么是分支
+
+分支就是一条独立的时间线。默认在 main 上，git switch -c xxx 就新建一条。
+
+```
+main:     A---B---C---D---E---F
+                        ^
+feat-x:                 X---Y---Z
+```
+
+main 和 feat-x 互不干扰，各自提交各自的。
+
+### 为什么需要分支
+
+没有分支时，所有人都在 main 上改，天天冲突。
+有分支时各改各的，最后合并。
+
+```
+main:          A---B---C
+                        |
+你(feat/a):           D---E
+张三(feat/b):         F---G
+```
+
+### 分支的完整生命周期
+
+1. git switch -c feat/xxx       # 创建分支
+2. 开发 + git commit             # 在分支上开发
+3. git push -u origin feat/xxx   # 推送到 GitHub
+4. 在 GitHub 开 PR                # 请求合并
+5. 同事 Review -> Merge           # 审查通过后合并
+6. git branch -d feat/xxx         # 删除本地分支
+7. git push origin --delete feat/xxx  # 删除远程分支
+
+### 分支命名规范
+
+main                    主分支，永远稳定
+feat/add-rescale        新功能
+fix/softmax-bug         修 bug
+doc/architecture-v2     文档
+refac/tile-controller   重构
+test/online-softmax     测试
+
+原则：一个分支只做一件事，做完就删。
+
+### 常见问题
+
+Q: 分支改到一半，main 上同事合了新代码？
+A: git pull --rebase，你的提交自动放到最前面。
+
+Q: 分支上改坏了想放弃？
+A: git checkout main 切回去，分支删掉重建。
 ---
 
 ## 二、分支命名规范
