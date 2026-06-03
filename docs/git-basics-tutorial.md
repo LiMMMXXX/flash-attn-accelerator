@@ -225,3 +225,21 @@ git push           (推送到 GitHub)
 ---
 
 # 教程结束
+
+
+---
+
+## 附：解决冲突
+
+两个人改了同一段代码时，git pull --rebase 会报：
+
+CONFLICT (content): Merge conflict in docs/git-basics-tutorial.md
+
+VS Code 中会看到：
+<<<<<<< HEAD        <- 你的改动
+=======             <- 分隔线
+>>>>>>> origin/main <- 远程的改动
+
+手动编辑保留正确代码，去掉标记行，然后：
+git add 文件名
+git rebase --continue
