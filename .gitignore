@@ -1,0 +1,32 @@
+# 依赖
+__pycache__/
+*.pyc
+*.pyo
+
+# 波形/日志
+*.vcd
+*.fsdb
+*.wlf
+sim/logs/
+
+# 综合
+*.log
+*.rpt
+
+# IDE
+*.swp
+*.swo
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Vivado (忽略参考示例中的 vivado 工程)
+*.jou
+*.xpr
+*.cache/
+*.hw/
+*.ip_user_files/
+*.sim/
