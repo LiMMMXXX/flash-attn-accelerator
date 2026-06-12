@@ -1,0 +1,1090 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="description" content="Flash Attention — Fast and Memory-Efficient Exact Attention with IO-Awareness. Understand how tiling, online softmax, and recomputation break through the memory wall.">
+<title>Flash Attention — Breaking the Memory Wall</title>
+
+<!-- Fonts -->
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Sora:wght@300;400;500;600;700&family=Inter:opsz,wght@14..32,400;14..32,500;14..32,600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+
+<!-- KaTeX for math rendering -->
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css" crossorigin="anonymous">
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js" crossorigin="anonymous"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js" crossorigin="anonymous"
+  onload="renderMathInElement(document.body, { delimiters: [{left: '$$', right: '$$', display: true}, {left: '$', right: '$', display: false}] })"></script>
+
+<style>
+/* ═══════════════════════════════════════════════════════════════
+   DESIGN TOKENS
+   Palette: "Compute Tiles" — GPU memory hierarchy as color
+   ═══════════════════════════════════════════════════════════════ */
+:root {
+  /* Backgrounds */
+  --bg-deep:       #060b14;
+  --bg-surface:    #0f1629;
+  --bg-elevated:   #192342;
+  --bg-high:       #1e2d52;
+
+  /* Accents — compute → SRAM → flash */
+  --accent-indigo: #818cf8;
+  --accent-sky:    #38bdf8;
+  --accent-amber:  #f59e0b;
+
+  /* Text */
+  --text-primary:  #e2e8f0;
+  --text-secondary:#94a3b8;
+  --text-muted:    #55607a;
+
+  /* Borders & dividers */
+  --border-subtle: #1e2d52;
+  --border-glow:   rgba(129, 140, 248, 0.25);
+
+  /* Grid animation colors */
+  --cell-idle:     rgba(56, 189, 248, 0.06);
+  --cell-hot:      rgba(56, 189, 248, 0.9);
+  --cell-warm:     rgba(129, 140, 248, 0.45);
+  --cell-cool:     rgba(129, 140, 248, 0.15);
+
+  /* Typography */
+  --font-display:  'Sora', sans-serif;
+  --font-body:     'Inter', sans-serif;
+  --font-mono:     'JetBrains Mono', monospace;
+
+  /* Type scale */
+  --text-hero:     clamp(2.5rem, 6vw, 4.5rem);
+  --text-heading:  clamp(1.5rem, 3vw, 2.25rem);
+  --text-subhead:  clamp(1.1rem, 2vw, 1.35rem);
+  --text-body:     1rem;
+  --text-caption:  0.875rem;
+  --text-small:    0.75rem;
+
+  /* Spacing */
+  --space-section: clamp(4rem, 10vw, 8rem);
+  --space-block:   clamp(1.5rem, 4vw, 3rem);
+
+  /* Misc */
+  --radius-sm:     4px;
+  --radius-md:     8px;
+  --radius-lg:     16px;
+  --max-width:     72rem;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   RESET & BASE
+   ═══════════════════════════════════════════════════════════════ */
+*, *::before, *::after {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html {
+  scroll-behavior: smooth;
+  background: var(--bg-deep);
+  color: var(--text-primary);
+  font-family: var(--font-body);
+  font-size: 16px;
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html { scroll-behavior: auto; }
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+body {
+  overflow-x: hidden;
+  background:
+    radial-gradient(ellipse 80% 60% at 50% -5%, rgba(129, 140, 248, 0.08), transparent),
+    radial-gradient(ellipse 50% 40% at 80% 40%, rgba(56, 189, 248, 0.05), transparent),
+    var(--bg-deep);
+}
+
+a { color: var(--accent-sky); text-decoration: none; transition: color 0.2s; }
+a:hover, a:focus-visible { color: var(--accent-indigo); }
+a:focus-visible { outline: 2px solid var(--accent-indigo); outline-offset: 2px; border-radius: var(--radius-sm); }
+
+::selection { background: rgba(129, 140, 248, 0.35); color: #fff; }
+
+img { max-width: 100%; display: block; }
+
+/* ═══════════════════════════════════════════════════════════════
+   LAYOUT PRIMITIVES
+   ═══════════════════════════════════════════════════════════════ */
+.container {
+  width: min(var(--max-width), 100% - 2rem);
+  margin-inline: auto;
+}
+
+.section {
+  padding-block: var(--space-section);
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   NAV
+   ═══════════════════════════════════════════════════════════════ */
+.nav {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 100;
+  padding-block: 1rem;
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  background: rgba(6, 11, 20, 0.7);
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.nav-inner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.nav-logo {
+  font-family: var(--font-display);
+  font-weight: 600;
+  font-size: 1rem;
+  color: var(--text-primary);
+  letter-spacing: -0.02em;
+}
+
+.nav-logo span {
+  color: var(--accent-sky);
+}
+
+.nav-links {
+  display: flex;
+  gap: 1.5rem;
+  list-style: none;
+}
+
+.nav-links a {
+  font-size: var(--text-caption);
+  color: var(--text-secondary);
+  font-weight: 500;
+  transition: color 0.2s;
+}
+
+.nav-links a:hover { color: var(--text-primary); }
+
+/* ═══════════════════════════════════════════════════════════════
+   HERO
+   ═══════════════════════════════════════════════════════════════ */
+.hero {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding-block: 6rem 4rem;
+  position: relative;
+  overflow: hidden;
+}
+
+.hero-content {
+  text-align: center;
+  z-index: 2;
+  max-width: 48rem;
+  margin-inline: auto;
+}
+
+.hero-eyebrow {
+  display: inline-block;
+  font-family: var(--font-mono);
+  font-size: var(--text-small);
+  font-weight: 500;
+  color: var(--accent-sky);
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  margin-bottom: 1.25rem;
+  padding: 0.35em 0.85em;
+  border: 1px solid rgba(56, 189, 248, 0.25);
+  border-radius: 999px;
+  background: rgba(56, 189, 248, 0.06);
+}
+
+.hero-title {
+  font-family: var(--font-display);
+  font-size: var(--text-hero);
+  font-weight: 700;
+  line-height: 1.08;
+  letter-spacing: -0.03em;
+  margin-bottom: 1.25rem;
+  color: var(--text-primary);
+}
+
+.hero-title em {
+  font-style: normal;
+  background: linear-gradient(135deg, var(--accent-sky), var(--accent-indigo));
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+
+.hero-subtitle {
+  font-size: var(--text-subhead);
+  color: var(--text-secondary);
+  font-weight: 400;
+  line-height: 1.5;
+  max-width: 36rem;
+  margin-inline: auto;
+  margin-bottom: 2.5rem;
+}
+
+.hero-meta {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 2rem;
+  flex-wrap: wrap;
+  font-size: var(--text-caption);
+  color: var(--text-muted);
+}
+
+.hero-meta-item {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.hero-meta-value {
+  font-family: var(--font-display);
+  font-size: 1.5rem;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.hero-meta-label {
+  color: var(--text-secondary);
+}
+
+/* Tiling Grid — the signature element */
+.tiling-grid-stage {
+  margin-top: 3rem;
+  position: relative;
+  z-index: 1;
+}
+
+.tiling-grid {
+  display: grid;
+  grid-template-columns: repeat(16, 1fr);
+  gap: 2px;
+  width: min(480px, 85vw);
+  aspect-ratio: 1;
+  margin-inline: auto;
+}
+
+.tiling-cell {
+  aspect-ratio: 1;
+  border-radius: 2px;
+  background: var(--cell-idle);
+  transition: background 0.15s ease;
+}
+
+.tiling-caption {
+  text-align: center;
+  font-size: var(--text-small);
+  color: var(--text-muted);
+  margin-top: 0.75rem;
+  font-family: var(--font-mono);
+}
+
+.tiling-caption span {
+  color: var(--accent-sky);
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   SECTION HEADINGS (shared)
+   ═══════════════════════════════════════════════════════════════ */
+.section-eyebrow {
+  font-family: var(--font-mono);
+  font-size: var(--text-small);
+  font-weight: 500;
+  color: var(--accent-amber);
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  margin-bottom: 0.75rem;
+}
+
+.section-heading {
+  font-family: var(--font-display);
+  font-size: var(--text-heading);
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  line-height: 1.2;
+  margin-bottom: 0.75rem;
+}
+
+.section-lede {
+  color: var(--text-secondary);
+  font-size: var(--text-subhead);
+  line-height: 1.5;
+  max-width: 40rem;
+  margin-bottom: var(--space-block);
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   PROBLEM SECTION
+   ═══════════════════════════════════════════════════════════════ */
+.problem-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 2.5rem;
+  align-items: start;
+}
+
+@media (max-width: 768px) {
+  .problem-grid { grid-template-columns: 1fr; }
+}
+
+.problem-card {
+  background: var(--bg-surface);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-lg);
+  padding: 2rem;
+}
+
+.problem-card-tag {
+  display: inline-block;
+  font-family: var(--font-mono);
+  font-size: var(--text-small);
+  font-weight: 500;
+  padding: 0.2em 0.65em;
+  border-radius: 999px;
+  margin-bottom: 1rem;
+}
+
+.problem-card-tag.sram {
+  background: rgba(56, 189, 248, 0.12);
+  color: var(--accent-sky);
+}
+
+.problem-card-tag.hbm {
+  background: rgba(245, 158, 11, 0.12);
+  color: var(--accent-amber);
+}
+
+.problem-card h3 {
+  font-family: var(--font-display);
+  font-size: 1.25rem;
+  font-weight: 600;
+  margin-bottom: 0.5rem;
+  color: var(--text-primary);
+}
+
+.problem-card p {
+  color: var(--text-secondary);
+  font-size: var(--text-body);
+  line-height: 1.65;
+  margin-bottom: 1rem;
+}
+
+.problem-stat {
+  display: flex;
+  align-items: baseline;
+  gap: 0.4rem;
+  margin-top: 1.25rem;
+  padding-top: 1.25rem;
+  border-top: 1px solid var(--border-subtle);
+}
+
+.problem-stat-value {
+  font-family: var(--font-display);
+  font-size: 2rem;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.problem-stat-unit {
+  font-size: var(--text-caption);
+  color: var(--text-muted);
+}
+
+.problem-formula {
+  margin-top: 2rem;
+  padding: 1.5rem;
+  background: var(--bg-elevated);
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border-subtle);
+  overflow-x: auto;
+  text-align: center;
+  color: var(--text-secondary);
+  font-size: var(--text-caption);
+}
+
+.problem-formula .katex { font-size: 1.1em; }
+
+/* ═══════════════════════════════════════════════════════════════
+   INSIGHT SECTION
+   ═══════════════════════════════════════════════════════════════ */
+.insight-list {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 1.5rem;
+}
+
+@media (max-width: 768px) {
+  .insight-list { grid-template-columns: 1fr; }
+}
+
+.insight-card {
+  background: var(--bg-surface);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-lg);
+  padding: 2rem;
+  position: relative;
+  overflow: hidden;
+  transition: border-color 0.3s, transform 0.3s;
+}
+
+.insight-card:hover {
+  border-color: var(--border-glow);
+  transform: translateY(-2px);
+}
+
+.insight-card::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 2px;
+}
+
+.insight-card:nth-child(1)::before { background: linear-gradient(90deg, var(--accent-sky), transparent); }
+.insight-card:nth-child(2)::before { background: linear-gradient(90deg, var(--accent-indigo), transparent); }
+.insight-card:nth-child(3)::before { background: linear-gradient(90deg, var(--accent-amber), transparent); }
+
+.insight-card-step {
+  font-family: var(--font-display);
+  font-size: 3rem;
+  font-weight: 700;
+  line-height: 1;
+  margin-bottom: 0.75rem;
+  -webkit-text-fill-color: transparent;
+  -webkit-background-clip: text;
+  background-clip: text;
+}
+
+.insight-card:nth-child(1) .insight-card-step { background-image: linear-gradient(135deg, var(--accent-sky), var(--accent-indigo)); }
+.insight-card:nth-child(2) .insight-card-step { background-image: linear-gradient(135deg, var(--accent-indigo), #c084fc); }
+.insight-card:nth-child(3) .insight-card-step { background-image: linear-gradient(135deg, var(--accent-amber), #fb923c); }
+
+.insight-card h3 {
+  font-family: var(--font-display);
+  font-size: 1.15rem;
+  font-weight: 600;
+  margin-bottom: 0.5rem;
+}
+
+.insight-card p {
+  color: var(--text-secondary);
+  font-size: var(--text-body);
+  line-height: 1.65;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   MATH SECTION
+   ═══════════════════════════════════════════════════════════════ */
+.math-block {
+  background: var(--bg-surface);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-lg);
+  padding: 2rem;
+  margin-bottom: 2rem;
+}
+
+.math-block h3 {
+  font-family: var(--font-display);
+  font-size: 1.15rem;
+  font-weight: 600;
+  margin-bottom: 1rem;
+  color: var(--accent-sky);
+}
+
+.math-block .formula {
+  overflow-x: auto;
+  padding: 1rem 0;
+  text-align: center;
+}
+
+.math-block .formula .katex { font-size: 1.15em; }
+
+.math-block .explanation {
+  color: var(--text-secondary);
+  font-size: var(--text-caption);
+  line-height: 1.7;
+  margin-top: 0.5rem;
+  padding-top: 1rem;
+  border-top: 1px solid var(--border-subtle);
+}
+
+.math-two-col {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1.5rem;
+}
+
+@media (max-width: 768px) {
+  .math-two-col { grid-template-columns: 1fr; }
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   BENCHMARKS
+   ═══════════════════════════════════════════════════════════════ */
+.benchmarks {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 1.5rem;
+}
+
+@media (max-width: 768px) {
+  .benchmarks { grid-template-columns: repeat(2, 1fr); }
+}
+
+@media (max-width: 480px) {
+  .benchmarks { grid-template-columns: 1fr; }
+}
+
+.bench-card {
+  background: var(--bg-surface);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-lg);
+  padding: 1.75rem;
+  text-align: center;
+}
+
+.bench-value {
+  font-family: var(--font-display);
+  font-size: 2.5rem;
+  font-weight: 700;
+  line-height: 1;
+  margin-bottom: 0.5rem;
+}
+
+.bench-value.speed  { color: var(--accent-sky); }
+.bench-value.memory { color: var(--accent-indigo); }
+.bench-value.length { color: var(--accent-amber); }
+.bench-value.adopt  { color: #34d399; }
+
+.bench-label {
+  font-size: var(--text-caption);
+  color: var(--text-secondary);
+  font-weight: 500;
+}
+
+.bench-note {
+  font-size: var(--text-small);
+  color: var(--text-muted);
+  margin-top: 0.25rem;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   PAPER CALLOUT
+   ═══════════════════════════════════════════════════════════════ */
+.paper-callout {
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-lg);
+  padding: 2.5rem;
+  text-align: center;
+  max-width: 40rem;
+  margin-inline: auto;
+}
+
+.paper-callout h3 {
+  font-family: var(--font-display);
+  font-size: 1.25rem;
+  font-weight: 600;
+  margin-bottom: 0.5rem;
+}
+
+.paper-callout p {
+  color: var(--text-secondary);
+  margin-bottom: 1.5rem;
+  line-height: 1.6;
+}
+
+.paper-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-family: var(--font-mono);
+  font-size: var(--text-caption);
+  color: var(--accent-sky);
+  padding: 0.6em 1.2em;
+  border: 1px solid rgba(56, 189, 248, 0.3);
+  border-radius: 999px;
+  background: rgba(56, 189, 248, 0.06);
+  transition: all 0.2s;
+}
+
+.paper-link:hover {
+  background: rgba(56, 189, 248, 0.14);
+  border-color: var(--accent-sky);
+  color: var(--accent-sky);
+}
+
+.paper-link svg {
+  width: 16px;
+  height: 16px;
+  flex-shrink: 0;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   FOOTER
+   ═══════════════════════════════════════════════════════════════ */
+.footer {
+  padding-block: 3rem;
+  border-top: 1px solid var(--border-subtle);
+  text-align: center;
+}
+
+.footer p {
+  font-size: var(--text-small);
+  color: var(--text-muted);
+}
+
+.footer a {
+  color: var(--text-secondary);
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   SCROLL REVEAL
+   ═══════════════════════════════════════════════════════════════ */
+.reveal {
+  opacity: 0;
+  transform: translateY(24px);
+  transition: opacity 0.7s ease, transform 0.7s ease;
+}
+
+.reveal.visible {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+/* Stagger children */
+.reveal-children > * {
+  opacity: 0;
+  transform: translateY(20px);
+  transition: opacity 0.6s ease, transform 0.6s ease;
+}
+
+.reveal-children.visible > *:nth-child(1) { transition-delay: 0s; }
+.reveal-children.visible > *:nth-child(2) { transition-delay: 0.1s; }
+.reveal-children.visible > *:nth-child(3) { transition-delay: 0.2s; }
+.reveal-children.visible > *:nth-child(4) { transition-delay: 0.3s; }
+
+.reveal-children.visible > * {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   REDUCED MOTION
+   ═══════════════════════════════════════════════════════════════ */
+@media (prefers-reduced-motion: reduce) {
+  .reveal,
+  .reveal-children > * {
+    opacity: 1;
+    transform: none;
+    transition: none;
+  }
+}
+</style>
+</head>
+<body>
+
+<!-- ═══════════════════════════════════════════════════
+     NAV
+     ═══════════════════════════════════════════════════ -->
+<nav class="nav" aria-label="Main navigation">
+  <div class="container nav-inner">
+    <a href="#" class="nav-logo">⚡ Flash<span>Attention</span></a>
+    <ul class="nav-links">
+      <li><a href="#problem">Problem</a></li>
+      <li><a href="#insight">Insight</a></li>
+      <li><a href="#how">How It Works</a></li>
+      <li><a href="#impact">Impact</a></li>
+    </ul>
+  </div>
+</nav>
+
+<!-- ═══════════════════════════════════════════════════
+     HERO
+     ═══════════════════════════════════════════════════ -->
+<section class="hero" aria-labelledby="hero-title">
+  <div class="hero-content">
+    <p class="hero-eyebrow">NeurIPS 2022 · Tri Dao et al.</p>
+    <h1 id="hero-title" class="hero-title">
+      Fast and <em>Memory-Efficient</em><br>Exact Attention
+    </h1>
+    <p class="hero-subtitle">
+      Flash Attention computes exact attention 2–4× faster by understanding
+      what makes GPUs slow — not the math, but the memory movement.
+    </p>
+    <div class="hero-meta">
+      <div class="hero-meta-item">
+        <span class="hero-meta-value">2–4×</span>
+        <span class="hero-meta-label">faster training</span>
+      </div>
+      <div class="hero-meta-item">
+        <span class="hero-meta-value">O(N)</span>
+        <span class="hero-meta-label">memory footprint</span>
+      </div>
+      <div class="hero-meta-item">
+        <span class="hero-meta-value">Exact</span>
+        <span class="hero-meta-label">not approximate</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- The signature: animated tiling grid -->
+  <div class="tiling-grid-stage reveal" aria-hidden="true">
+    <div class="tiling-grid" id="tilingGrid"></div>
+    <p class="tiling-caption">
+      Each <span>4×4 tile</span> fits in SRAM — the full N×N matrix is never materialized
+    </p>
+  </div>
+</section>
+
+<!-- ═══════════════════════════════════════════════════
+     PROBLEM: The Memory Wall
+     ═══════════════════════════════════════════════════ -->
+<section id="problem" class="section" aria-labelledby="problem-heading">
+  <div class="container">
+    <p class="section-eyebrow reveal">The Memory Wall</p>
+    <h2 id="problem-heading" class="section-heading reveal">Attention is compute-bound — or is it?</h2>
+    <p class="section-lede reveal">
+      On modern GPUs, the bottleneck isn't floating-point math. It's the time spent
+      reading and writing intermediate tensors to GPU memory — especially that N×N
+      attention matrix.
+    </p>
+
+    <div class="problem-grid reveal-children">
+      <div class="problem-card">
+        <span class="problem-card-tag hbm">HBM · High Bandwidth Memory</span>
+        <h3>GPU DRAM — the slow giant</h3>
+        <p>
+          Where the large N×N attention matrix <strong>S = QK<sup>T</sup></strong> lives.
+          HBM is big (40–80 GB) but reading and writing it runs at just 1.5–2 TB/s —
+          the bottleneck for every standard attention implementation.
+        </p>
+        <div class="problem-stat">
+          <span class="problem-stat-value">1.5</span>
+          <span class="problem-stat-unit">TB/s bandwidth</span>
+        </div>
+      </div>
+
+      <div class="problem-card">
+        <span class="problem-card-tag sram">SRAM · Static Random-Access Memory</span>
+        <h3>On-chip cache — the fast sliver</h3>
+        <p>
+          Each GPU streaming multiprocessor has a small pool of SRAM (~100 KB) that runs
+          at 19 TB/s. The key insight: <strong>compute tiles that fit in SRAM</strong>,
+          and never write the full attention matrix to slow HBM.
+        </p>
+        <div class="problem-stat">
+          <span class="problem-stat-value">19</span>
+          <span class="problem-stat-unit">TB/s bandwidth</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="problem-formula reveal" aria-label="Standard scaled dot-product attention formula">
+      $$ \text{Attention}(Q, K, V) = \text{softmax}\!\left(\frac{QK^T}{\sqrt{d}}\right) V $$
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════════════════════════════════════════════
+     INSIGHT: Three Key Ideas
+     ═══════════════════════════════════════════════════ -->
+<section id="insight" class="section" aria-labelledby="insight-heading">
+  <div class="container">
+    <p class="section-eyebrow reveal">The Core Insight</p>
+    <h2 id="insight-heading" class="section-heading reveal">Three ideas that changed everything</h2>
+    <p class="section-lede reveal">
+      IO-aware attention isn't one trick — it's three algorithmic ideas working together
+      to keep data in fast SRAM from start to finish.
+    </p>
+
+    <div class="insight-list reveal-children">
+      <article class="insight-card">
+        <div class="insight-card-step">01</div>
+        <h3>Tiling</h3>
+        <p>
+          Split Q, K, V into blocks that fit in SRAM. Load one tile at a time,
+          compute partial attention, accumulate the result — never touch the full
+          N×N matrix in slow HBM.
+        </p>
+      </article>
+
+      <article class="insight-card">
+        <div class="insight-card-step">02</div>
+        <h3>Online Softmax</h3>
+        <p>
+          Standard softmax needs two passes: one for the max, one for the sum.
+          Flash Attention tracks running statistics and <em>rescales</em> as new
+          tiles arrive, processing the entire row in one streaming pass.
+        </p>
+      </article>
+
+      <article class="insight-card">
+        <div class="insight-card-step">03</div>
+        <h3>Recomputation</h3>
+        <p>
+          During backpropagation, instead of storing the full attention matrix
+          from the forward pass, recompute tiles on-the-fly. Trading a small
+          amount of compute for a large reduction in memory.
+        </p>
+      </article>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════════════════════════════════════════════
+     HOW IT WORKS
+     ═══════════════════════════════════════════════════ -->
+<section id="how" class="section" aria-labelledby="how-heading">
+  <div class="container">
+    <p class="section-eyebrow reveal">How It Works</p>
+    <h2 id="how-heading" class="section-heading reveal">Online softmax — the algorithmic heart</h2>
+    <p class="section-lede reveal">
+      The key challenge: softmax requires the entire row at once. Flash Attention
+      solves this with a streaming rescaling trick that processes tiles sequentially.
+    </p>
+
+    <div class="math-two-col reveal-children">
+      <div class="math-block">
+        <h3>Standard Safe Softmax</h3>
+        <div class="formula">
+          $$ m = \max_i x_i \qquad \ell = \sum_i e^{x_i - m} \qquad y_i = \frac{e^{x_i - m}}{\ell} $$
+        </div>
+        <p class="explanation">
+          Three passes over the data: find the max, sum the exponentials, then
+          normalize. Each pass reads from HBM — expensive for large N.
+        </p>
+      </div>
+
+      <div class="math-block">
+        <h3>Online Softmax (Flash Attention)</h3>
+        <div class="formula">
+          $$ \begin{aligned} m^{\text{new}} &= \max(m^{\text{old}}, m^{\text{local}}) \\ \ell^{\text{new}} &= e^{m^{\text{old}} - m^{\text{new}}} \ell^{\text{old}} + e^{m^{\text{local}} - m^{\text{new}}} \ell^{\text{local}} \end{aligned} $$
+        </div>
+        <p class="explanation">
+          One pass. Maintain running max <em>m</em> and sum <em>ℓ</em>. When a new block
+          arrives, rescale the previous result if the new block has a larger max —
+          mathematically identical to the three-pass version.
+        </p>
+      </div>
+    </div>
+
+    <div class="math-block reveal" style="margin-top: 1.5rem;">
+      <h3>The Tiling Loop</h3>
+      <div class="formula">
+        $$ \text{For each tile } (i, j):\quad S_{ij}^{\text{local}} = Q_i K_j^T,\quad \tilde{P}_{ij} = e^{S_{ij}^{\text{local}} - m_i},\quad O_i \leftarrow \text{rescale and accumulate} $$
+      </div>
+      <p class="explanation">
+        The outer loops iterate over Q tiles and K/V tiles. For each pair, compute
+        the local attention scores entirely in SRAM, update the online softmax state,
+        and accumulate into the output — without ever writing the full S matrix to HBM.
+      </p>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════════════════════════════════════════════
+     IMPACT
+     ═══════════════════════════════════════════════════ -->
+<section id="impact" class="section" aria-labelledby="impact-heading">
+  <div class="container">
+    <p class="section-eyebrow reveal">Impact</p>
+    <h2 id="impact-heading" class="section-heading reveal">From research paper to every major LLM</h2>
+    <p class="section-lede reveal">
+      Flash Attention went from a NeurIPS paper to a core component of the modern
+      ML stack in under two years. It's now the default attention implementation
+      in PyTorch, used by GPT-4, Llama, Gemini, and more.
+    </p>
+
+    <div class="benchmarks reveal-children">
+      <div class="bench-card">
+        <div class="bench-value speed">2–4×</div>
+        <div class="bench-label">Training speedup</div>
+        <div class="bench-note">vs standard attention</div>
+      </div>
+      <div class="bench-card">
+        <div class="bench-value memory">O(N)</div>
+        <div class="bench-label">Memory complexity</div>
+        <div class="bench-note">down from O(N²)</div>
+      </div>
+      <div class="bench-card">
+        <div class="bench-value length">64K+</div>
+        <div class="bench-label">Context length</div>
+        <div class="bench-note">now practical</div>
+      </div>
+      <div class="bench-card">
+        <div class="bench-value adopt">10K+</div>
+        <div class="bench-label">GitHub stars</div>
+        <div class="bench-note">and counting</div>
+      </div>
+    </div>
+
+    <div class="paper-callout reveal" style="margin-top: 3rem;">
+      <h3>Read the paper</h3>
+      <p>
+        "FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness"
+        by Tri Dao, Daniel Y. Fu, Stefano Ermon, Atri Rudra, and Christopher Ré.
+        Published at NeurIPS 2022.
+      </p>
+      <a href="https://arxiv.org/abs/2205.14135" class="paper-link" target="_blank" rel="noopener">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg>
+        arXiv:2205.14135
+      </a>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════════════════════════════════════════════
+     FOOTER
+     ═══════════════════════════════════════════════════ -->
+<footer class="footer">
+  <div class="container">
+    <p>
+      Built to explain a beautiful algorithm. Paper by <a href="https://tridao.me/" target="_blank" rel="noopener">Tri Dao</a> et al.
+      Flash Attention is open source under the BSD license.
+    </p>
+  </div>
+</footer>
+
+<!-- ═══════════════════════════════════════════════════
+     SCRIPTS
+     ═══════════════════════════════════════════════════ -->
+<script>
+/* ── Tiling Grid Animation ──────────────────────── */
+(function() {
+  const grid = document.getElementById('tilingGrid');
+  const SIZE = 16;
+  const TILE = 4;
+  const STEPS = SIZE - TILE + 1;   // 13 positions per axis
+  const DECAY = 0.02;              // heat decay per frame
+  const STEP_INTERVAL = 120;       // ms between tile moves
+
+  // Build grid cells
+  const cells = [];
+  grid.innerHTML = '';
+  for (let r = 0; r < SIZE; r++) {
+    cells[r] = [];
+    for (let c = 0; c < SIZE; c++) {
+      const cell = document.createElement('div');
+      cell.className = 'tiling-cell';
+      grid.appendChild(cell);
+      cells[r][c] = { el: cell, heat: 0 };
+    }
+  }
+
+  // Tile state
+  let tileRow = 0;
+  let tileCol = 0;
+  let lastStep = 0;
+
+  function setCellColor(cell, heat) {
+    // Heat 0 → idle; heat 1 → hot sky; interpolate with smooth falloff
+    const t = Math.min(1, Math.max(0, heat));
+
+    // Ease the heat curve for a nicer glow
+    const eased = t < 0.3 ? t / 0.3 * 0.4 : 0.4 + 0.6 * (1 - Math.exp(-4 * (t - 0.3)));
+
+    const r = Math.round(56  + eased * (56 - 56));    // stays near sky
+    const g = Math.round(30  + eased * (189 - 30));
+    const b = Math.round(40  + eased * (248 - 40));
+    const a = 0.06 + eased * 0.84;
+
+    cell.el.style.background = `rgba(${r},${g},${b},${a.toFixed(3)})`;
+  }
+
+  function tick(now) {
+    // Move tile on interval
+    if (now - lastStep >= STEP_INTERVAL) {
+      // Set current tile cells to heat=1
+      for (let r = tileRow; r < tileRow + TILE; r++) {
+        for (let c = tileCol; c < tileCol + TILE; c++) {
+          cells[r][c].heat = 1;
+        }
+      }
+
+      // Advance tile position (snake pattern)
+      tileCol++;
+      if (tileCol >= STEPS) {
+        tileCol = 0;
+        tileRow++;
+        if (tileRow >= STEPS) {
+          tileRow = 0;
+        }
+      }
+      lastStep = now;
+    }
+
+    // Decay all heats and update cells
+    for (let r = 0; r < SIZE; r++) {
+      for (let c = 0; c < SIZE; c++) {
+        const cell = cells[r][c];
+        cell.heat = Math.max(0, cell.heat - DECAY);
+        setCellColor(cell, cell.heat);
+      }
+    }
+
+    requestAnimationFrame(tick);
+  }
+
+  requestAnimationFrame(tick);
+})();
+
+/* ── Scroll Reveal ─────────────────────────────── */
+(function() {
+  const observer = new IntersectionObserver((entries) => {
+    entries.forEach(entry => {
+      if (entry.isIntersecting) {
+        entry.target.classList.add('visible');
+        observer.unobserve(entry.target);
+      }
+    });
+  }, { threshold: 0.15, rootMargin: '0px 0px -40px 0px' });
+
+  document.querySelectorAll('.reveal, .reveal-children').forEach(el => {
+    observer.observe(el);
+  });
+})();
+
+/* ── Nav scroll state ──────────────────────────── */
+(function() {
+  const nav = document.querySelector('.nav');
+  let lastScroll = 0;
+
+  window.addEventListener('scroll', () => {
+    const now = window.scrollY;
+    if (now > 100 && now > lastScroll) {
+      nav.style.transform = 'translateY(-100%)';
+    } else {
+      nav.style.transform = 'translateY(0)';
+    }
+    lastScroll = now;
+  }, { passive: true });
+})();
+</script>
+
+</body>
+</html>
